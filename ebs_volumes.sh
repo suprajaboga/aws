@@ -1,53 +1,45 @@
 #!/bin/bash
 
-# File paths
-ACCOUNTS_FILE="./accounts.txt"  # List of AWS account numbers
-OUTPUT_CSV="./ebs_filtered_volumes.csv"  # Output CSV file
+CONFIG_FILE="$HOME/.aws/config"  # Update this if your config file is elsewhere
+OUTPUT_FILE="ebs_gp2_volumes.csv"
 
-# AWS regions to scan
-AWS_REGIONS=("ap-south-1")  # Modify as needed
+# Headers for CSV file
+echo "accountid,region,size,volume_type,volume_id,created_date,state" > "$OUTPUT_FILE"
 
-# Function to fetch AWS profiles dynamically
-get_selected_profiles() {
-    local matched_profiles=()
+# Extract AWS account IDs and profile names from the config file
+ACCOUNTS=$(grep -oP '(?<=sso_account_id = )\d+' "$CONFIG_FILE" | sort -u)
+PROFILES=$(grep -oP '(?<=\[profile ).*(?=\])' "$CONFIG_FILE")
 
-    while IFS= read -r account_id; do
-        profile_name="sso-${account_id}"  # Modify if your SSO profile naming is different
-        matched_profiles+=("$account_id:$profile_name")
-    done < "$ACCOUNTS_FILE"
+# Define regions (Modify based on your AWS usage)
+REGIONS=("us-east-1" "us-west-2" "eu-west-1")  # Add all required AWS regions
 
-    echo "${matched_profiles[@]}"
-}
+# Loop through each AWS account profile
+for PROFILE in $PROFILES; do
+    echo "Logging into AWS SSO for Profile: $PROFILE"
+    
+    # Attempt to log in only if the session is expired
+    aws sts get-caller-identity --profile "$PROFILE" &>/dev/null
+    if [[ $? -ne 0 ]]; then
+        aws sso login --profile "$PROFILE"
+    fi
 
-# Function to get EBS volumes of type gp2
-get_ebs_volumes() {
-    local account_id="$1"
-    local profile_name="$2"
+    # Get the account ID linked to this profile
+    ACCOUNT=$(grep -A 5 "\[profile $PROFILE\]" "$CONFIG_FILE" | grep -oP '(?<=sso_account_id = )\d+' | head -n 1)
+    
+    # Loop through each region
+    for REGION in "${REGIONS[@]}"; do
+        echo "  Checking EBS volumes in Region: $REGION for Account: $ACCOUNT"
 
-    for region in "${AWS_REGIONS[@]}"; do
-        echo "🔍 Scanning region $region for account $account_id ($profile_name)..."
+        # Fetch all EBS volumes
+        VOLUMES=$(aws ec2 describe-volumes --region "$REGION" --query 'Volumes[*].[VolumeId,Size,VolumeType,CreateTime,State]' --output text --profile "$PROFILE")
 
-        aws ec2 describe-volumes --profile "$profile_name" --region "$region" --output text \
-        --query "Volumes[*].[VolumeId, Size, VolumeType, CreateTime, State]" | while read -r volume_id size volume_type created_date state; do
-           
-            if [[ "$volume_type" == "gp2" ]]; then
-                echo "$account_id,$region,$size,$volume_type,$volume_id,$created_date,$state" >> "$OUTPUT_CSV"
+        # Process each volume
+        echo "$VOLUMES" | while read -r VOLUME_ID SIZE TYPE CREATED STATE; do
+            if [[ "$TYPE" == "gp2" ]]; then
+                echo "$ACCOUNT,$REGION,$SIZE,$TYPE,$VOLUME_ID,$CREATED,$STATE" >> "$OUTPUT_FILE"
             fi
         done
     done
-}
-
-# Main execution
-echo "Fetching AWS accounts and profiles..."
-PROFILES=$(get_selected_profiles)
-
-# Write CSV header
-echo "Account Number,Region,Storage Size (GB),Volume Type,Volume ID,Created Date,Volume State" > "$OUTPUT_CSV"
-
-# Process each AWS account
-for profile in $PROFILES; do
-    IFS=":" read -r account_id profile_name <<< "$profile"
-    get_ebs_volumes "$account_id" "$profile_name"
 done
 
-echo "✅ EBS report generated: $OUTPUT_CSV"
+echo "Script execution complete. CSV file generated: $OUTPUT_FILE"
